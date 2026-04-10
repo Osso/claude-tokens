@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Deserialize)]
 struct Message {
@@ -30,6 +31,35 @@ struct Usage {
     cache_read_input_tokens: u64,
 }
 
+#[derive(Clone, Copy)]
+enum Period {
+    Total,
+    Week,
+    Month,
+}
+
+impl Period {
+    fn label(self) -> &'static str {
+        match self {
+            Period::Total => "all time",
+            Period::Week => "past 7 days",
+            Period::Month => "past 30 days",
+        }
+    }
+
+    fn cutoff_secs(self) -> Option<u64> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        match self {
+            Period::Total => None,
+            Period::Week => Some(now - 7 * 86400),
+            Period::Month => Some(now - 30 * 86400),
+        }
+    }
+}
+
 /// Per-million-token pricing: (input, output, cache_write, cache_read)
 fn model_pricing(model: &str) -> (f64, f64, f64, f64) {
     match model {
@@ -43,12 +73,9 @@ fn model_pricing(model: &str) -> (f64, f64, f64, f64) {
 }
 
 fn usage_cost(usage: &Usage, model: &str) -> f64 {
-    let (inp, out, cw, cr) = model_pricing(model);
+    let (inp, out, _, _) = model_pricing(model);
     let m = 1_000_000.0;
-    usage.input_tokens as f64 * inp / m
-        + usage.output_tokens as f64 * out / m
-        + usage.cache_creation_input_tokens as f64 * cw / m
-        + usage.cache_read_input_tokens as f64 * cr / m
+    usage.input_tokens as f64 * inp / m + usage.output_tokens as f64 * out / m
 }
 
 #[derive(Default)]
@@ -63,7 +90,7 @@ struct ProjectStats {
 
 impl ProjectStats {
     fn total_tokens(&self) -> u64 {
-        self.input_tokens + self.output_tokens + self.cache_write_tokens + self.cache_read_tokens
+        self.input_tokens + self.output_tokens
     }
 
     fn accumulate(&mut self, other: &ProjectStats) {
@@ -227,6 +254,23 @@ fn collect_jsonl_files(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// Check if a file was modified on or after the cutoff timestamp.
+fn file_in_range(path: &Path, cutoff_secs: Option<u64>) -> bool {
+    let Some(cutoff) = cutoff_secs else {
+        return true;
+    };
+    let Ok(meta) = path.metadata() else {
+        return false;
+    };
+    let Ok(mtime) = meta.modified() else {
+        return false;
+    };
+    let Ok(mtime_secs) = mtime.duration_since(UNIX_EPOCH) else {
+        return false;
+    };
+    mtime_secs.as_secs() >= cutoff
+}
+
 fn process_zst(path: &Path, stats: &mut ProjectStats) {
     let Ok(file) = fs::File::open(path) else {
         return;
@@ -329,8 +373,6 @@ fn stats_row(rank: &str, name: &str, stats: &ProjectStats, bold_all: bool) -> Ve
         attr(Cell::new(stats.sessions)),
         attr(Cell::new(format_tokens(stats.input_tokens))),
         attr(Cell::new(format_tokens(stats.output_tokens))),
-        attr(Cell::new(format_tokens(stats.cache_write_tokens))),
-        attr(Cell::new(format_tokens(stats.cache_read_tokens))),
         attr(Cell::new(format_tokens(stats.total_tokens())).add_attribute(Attribute::Bold)),
         attr(Cell::new(format!("${:.2}", stats.cost)).fg(cost_color(stats.cost))),
     ]
@@ -344,19 +386,17 @@ fn stats_row_dimmed(rank: &str, name: &str, stats: &ProjectStats) -> Vec<Cell> {
         dim(Cell::new(stats.sessions)),
         dim(Cell::new(format_tokens(stats.input_tokens))),
         dim(Cell::new(format_tokens(stats.output_tokens))),
-        dim(Cell::new(format_tokens(stats.cache_write_tokens))),
-        dim(Cell::new(format_tokens(stats.cache_read_tokens))),
         dim(Cell::new(format_tokens(stats.total_tokens()))),
         dim(Cell::new(format!("${:.2}", stats.cost))),
     ]
 }
 
-fn print_leaderboard(sorted: &[(String, ProjectStats)]) {
+fn print_leaderboard(sorted: &[(String, ProjectStats)], period: Period) {
+    println!("Claude Code token usage ({})\n", period.label());
+
     let mut table = Table::new();
     table.set_header(
-        [
-            "#", "Project", "Sessions", "Input", "Output", "Cache W", "Cache R", "Total", "Cost",
-        ]
+        ["#", "Project", "Sessions", "Input", "Output", "Total", "Cost"]
         .map(|h| Cell::new(h).add_attribute(Attribute::Bold)),
     );
 
@@ -375,7 +415,7 @@ fn print_leaderboard(sorted: &[(String, ProjectStats)]) {
     println!("{table}");
 }
 
-fn gather_stats() -> Vec<(String, ProjectStats)> {
+fn gather_stats(period: Period) -> Vec<(String, ProjectStats)> {
     let projects_dir = dirs::home_dir()
         .expect("no home dir")
         .join(".claude/projects");
@@ -386,6 +426,7 @@ fn gather_stats() -> Vec<(String, ProjectStats)> {
     };
 
     let name_map = build_name_map();
+    let cutoff_secs = period.cutoff_secs();
     let mut all_stats: HashMap<String, ProjectStats> = HashMap::new();
     let mut seen: HashSet<String> = HashSet::new();
 
@@ -400,13 +441,16 @@ fn gather_stats() -> Vec<(String, ProjectStats)> {
         let project_name = project_name_from_dir(&dir_name, &name_map);
         let stats = all_stats.entry(project_name).or_default();
         for jsonl in collect_jsonl_files(&entry.path()) {
+            if !file_in_range(&jsonl, cutoff_secs) {
+                continue;
+            }
             let id = jsonl.file_stem().unwrap().to_string_lossy().to_string();
             seen.insert(id);
             process_jsonl(&jsonl, stats);
         }
     }
 
-    scan_archive(&name_map, &mut all_stats, &mut seen);
+    scan_archive(&name_map, &mut all_stats, &mut seen, cutoff_secs);
 
     let all_stats = merge_subdirs(all_stats);
 
@@ -470,6 +514,7 @@ fn scan_archive(
     name_map: &HashMap<String, String>,
     all_stats: &mut HashMap<String, ProjectStats>,
     seen: &mut HashSet<String>,
+    cutoff_secs: Option<u64>,
 ) {
     let archive_dir = dirs::home_dir().unwrap().join(".claude/archive");
     let Ok(entries) = fs::read_dir(&archive_dir) else {
@@ -478,6 +523,9 @@ fn scan_archive(
     for entry in entries.flatten() {
         let filename = entry.file_name().to_string_lossy().to_string();
         if !filename.ends_with(".jsonl.zst") {
+            continue;
+        }
+        if !file_in_range(&entry.path(), cutoff_secs) {
             continue;
         }
         let Some(session_id) = archive_session_id(&filename) else {
@@ -495,7 +543,22 @@ fn scan_archive(
     }
 }
 
+fn parse_period() -> Period {
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(|s| s.as_str()) {
+        Some("week" | "w" | "7d") => Period::Week,
+        Some("month" | "m" | "30d") => Period::Month,
+        Some("total" | "all" | "a") | None => Period::Total,
+        Some(other) => {
+            eprintln!("Unknown period: {other}");
+            eprintln!("Usage: claude-tokens [week|month|total]");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn main() {
-    let stats = gather_stats();
-    print_leaderboard(&stats);
+    let period = parse_period();
+    let stats = gather_stats(period);
+    print_leaderboard(&stats, period);
 }
