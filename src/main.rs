@@ -34,6 +34,7 @@ struct Usage {
 #[derive(Clone, Copy)]
 enum Period {
     Total,
+    Day,
     Week,
     Month,
 }
@@ -42,6 +43,7 @@ impl Period {
     fn label(self) -> &'static str {
         match self {
             Period::Total => "all time",
+            Period::Day => "past 24 hours",
             Period::Week => "past 7 days",
             Period::Month => "past 30 days",
         }
@@ -54,6 +56,7 @@ impl Period {
             .as_secs();
         match self {
             Period::Total => None,
+            Period::Day => Some(now - 86400),
             Period::Week => Some(now - 7 * 86400),
             Period::Month => Some(now - 30 * 86400),
         }
@@ -431,23 +434,7 @@ fn gather_stats(period: Period) -> Vec<(String, ProjectStats)> {
     let mut seen: HashSet<String> = HashSet::new();
 
     for entry in entries.flatten() {
-        if !entry.path().is_dir() {
-            continue;
-        }
-        let dir_name = entry.file_name().to_string_lossy().to_string();
-        if dir_name == "memory" {
-            continue;
-        }
-        let project_name = project_name_from_dir(&dir_name, &name_map);
-        let stats = all_stats.entry(project_name).or_default();
-        for jsonl in collect_jsonl_files(&entry.path()) {
-            if !file_in_range(&jsonl, cutoff_secs) {
-                continue;
-            }
-            let id = jsonl.file_stem().unwrap().to_string_lossy().to_string();
-            seen.insert(id);
-            process_jsonl(&jsonl, stats);
-        }
+        gather_project_dir_stats(&entry, &name_map, cutoff_secs, &mut all_stats, &mut seen);
     }
 
     scan_archive(&name_map, &mut all_stats, &mut seen, cutoff_secs);
@@ -460,6 +447,32 @@ fn gather_stats(period: Period) -> Vec<(String, ProjectStats)> {
         .collect();
     sorted.sort_by(|a, b| b.1.total_tokens().cmp(&a.1.total_tokens()));
     sorted
+}
+
+fn gather_project_dir_stats(
+    entry: &fs::DirEntry,
+    name_map: &HashMap<String, String>,
+    cutoff_secs: Option<u64>,
+    all_stats: &mut HashMap<String, ProjectStats>,
+    seen: &mut HashSet<String>,
+) {
+    if !entry.path().is_dir() {
+        return;
+    }
+    let dir_name = entry.file_name().to_string_lossy().to_string();
+    if dir_name == "memory" {
+        return;
+    }
+    let project_name = project_name_from_dir(&dir_name, name_map);
+    let stats = all_stats.entry(project_name).or_default();
+    for jsonl in collect_jsonl_files(&entry.path()) {
+        if !file_in_range(&jsonl, cutoff_secs) {
+            continue;
+        }
+        let id = jsonl.file_stem().unwrap().to_string_lossy().to_string();
+        seen.insert(id);
+        process_jsonl(&jsonl, stats);
+    }
 }
 
 /// Merge subdirectory entries into their closest parent project.
@@ -546,12 +559,13 @@ fn scan_archive(
 fn parse_period() -> Period {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(|s| s.as_str()) {
+        Some("day" | "d" | "24h" | "1d") => Period::Day,
         Some("week" | "w" | "7d") => Period::Week,
         Some("month" | "m" | "30d") => Period::Month,
         Some("total" | "all" | "a") | None => Period::Total,
         Some(other) => {
             eprintln!("Unknown period: {other}");
-            eprintln!("Usage: claude-tokens [week|month|total]");
+            eprintln!("Usage: claude-tokens [day|week|month|total]");
             std::process::exit(1);
         }
     }
